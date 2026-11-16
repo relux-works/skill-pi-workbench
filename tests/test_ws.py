@@ -319,7 +319,9 @@ class Ledger(unittest.TestCase):
             msg("2026-01-01T02:00:00Z", "user", "New task: read tasks/a2a-t2.md in full"),
             msg("2026-01-01T02:03:00Z", "assistant", usage=USAGE),
             msg("2026-01-01T03:00:00Z", "user", "New task: read tasks/t3.md in full"),
-            msg("2026-01-01T03:01:00Z", "assistant", usage=USAGE)])
+            msg("2026-01-01T03:01:00Z", "assistant", usage=USAGE),
+            {"type": "message", "message": {"role": "user", "content": "read tasks/t4.md"}},  # no timestamp
+            msg("2026-01-01T03:02:00Z", "assistant", usage=USAGE)])
         with open(os.path.join(c["dir"], "out", "t1-REVIEW.md"), "w") as f:
             f.write("ACCEPT\nfine\n")
         with open(os.path.join(c["dir"], "out", "a2a-t2.patch"), "w") as f:
@@ -335,6 +337,7 @@ class Ledger(unittest.TestCase):
             c = self.seat(t)
             rows = ws.ledger_update("rev-1", c, now=datetime(2026, 1, 1, 4, tzinfo=timezone.utc))
             self.assertEqual([r["task"] for r in rows], ["t1", "a2a-t2"])
+            self.assertEqual(len(list(ws.segments(c["dir"]))), 3)  # t1, a2a-t2, t3: no duplicate span for t4
             r1, r2 = rows
             self.assertEqual((r1["input"], r1["output"], r1["cache_read"], r1["cache_write"], r1["turns"]), (20, 200, 2000, 100, 2))
             self.assertEqual((r1["cost_usd"], r1["outcome"], r1["wall_min"], r1["thinking"]), (0.5, "ACCEPT", 10.0, "xhigh"))
@@ -432,7 +435,23 @@ class Commands(unittest.TestCase):
             with open(log) as f:
                 self.assertIn("send-keys -t =ws-s-1:", f.read())
 
-    # Claim: `autostart --dry-run` prints the units without writing or loading anything.
+    # Claim: `ws nudge` re-types the nudge for a task already in tasks/ and never rewrites it; an unknown task id is
+    # refused (control: the known id passes).
+    def test_nudge(self):
+        with tempfile.TemporaryDirectory() as t:
+            c, log = self.seat(t)
+            p = os.path.join(c["dir"], "tasks", "a2a-x.md")
+            with open(p, "w") as f:
+                f.write("keep\n")
+            self.assertEqual(ws.main(["ws", "nudge", "s-1", "a2a-x"]), 0)
+            self.assertEqual(ws.main(["ws", "nudge", "s-1", "a2a-missing"]), 2)
+            with open(p) as f:
+                self.assertEqual(f.read(), "keep\n")
+            with open(log) as f:
+                self.assertIn("read tasks/a2a-x.md", f.read())
+
+    # Claim: `autostart --dry-run` prints the units and writes no unit file (it returns before any systemctl or
+    # launchctl call, which the code shows; this test asserts only the print and the absent files).
     def test_autostart_dry_run(self):
         import contextlib, io
         with tempfile.TemporaryDirectory() as t:

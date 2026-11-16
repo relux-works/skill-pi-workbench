@@ -27,7 +27,7 @@ SEAT_DIR/
 All commands are one script, `scripts/ws` (Python 3, standard library only). Call it by its path (or the shim your
 skill manager installs); boot units call it by absolute path with `python3 -I`.
 
-Requirements: tmux 3.2 or newer (`new-session -e`), pi on the machine with its own auth (`pi /login` or its auth file),
+Requirements: tmux 3.2 or newer (`new-session -e`), pi on the machine with its own auth (`/login` inside pi, or its auth file),
 and for an identity the a2a CLI ([skill-a2a](https://github.com/relux-works/skill-a2a)). Boot units get NO login shell
 environment: a key exported in `.zshrc` or `.bashrc` never reaches the seat, so keep provider keys in pi's own auth.
 
@@ -43,20 +43,20 @@ environment: a key exported in `.zshrc` or `.bashrc` never reaches the seat, so 
 ## Set up a seat
 
 ```sh
-WS=/path/to/skill-pi-workbench/scripts/ws
+ws() { python3 -I /path/to/skill-pi-workbench/scripts/ws "$@"; }   # a function works in sh, bash and zsh
 # 1. config + layout (pi argv after --; the first word is made absolute)
-$WS init review-1 --dir ~/workbench/review-1 \
+ws init review-1 --dir ~/workbench/review-1 \
     --identity host1_project-ws_rev --role rev --project project-ws \
     --allow @owner:example.org --allow @lead-orch:example.org \
     -- pi --provider anthropic --model claude-opus-5-5 --thinking xhigh
 # 2. edit ~/workbench/review-1/AGENTS.md: the role, what to review, where to write
 # 3. the Swarma identity (needs the a2a CLI and its owner-approved server profile; see the a2a skill)
-$WS identity review-1        # a2a identity ensure --role rev --project project-ws --runtime none --dir SEAT_DIR
+ws identity review-1        # a2a identity ensure --role rev --project project-ws --runtime none --dir SEAT_DIR
 #    then by hand, because it is outward-facing: publish the agent card, post the join notice your swarm expects
 #    (both described in skill-a2a)
 # 4. start now and after every reboot
-$WS autostart review-1
-$WS status
+ws autostart review-1
+ws status
 ```
 
 `ws init` writes `$XDG_CONFIG_HOME/pi-workbench/seats/SEAT.json` (0600) with: `dir`, `pi` (argv, absolute first word),
@@ -90,7 +90,7 @@ Check after a reboot: `ws status` (session up), `tmux ls`, `systemctl --user sta
 ## Hand a task to a seat
 
 ```sh
-$WS task review-1 /path/to/<id>.md     # copied to tasks/<id>.md (exclusive), then typed into the session
+ws task review-1 /path/to/<id>.md     # copied to tasks/<id>.md (exclusive), then typed into the session
 ls ~/workbench/review-1/out/<id>-*
 ```
 
@@ -117,8 +117,8 @@ seat but comes from a sender not in `allow` is logged in `bridge.log` and never 
 refusal reason beside an accepted control). Room event IDs that contain `:` (room versions 1 and 2) are not accepted.
 
 Delivery is **at most once**: `a2a inbox` receipts the entries before the bridge writes the tasks, so a crash in
-between loses that batch (it stays visible in the room). A task whose nudge fails stays in `tasks/`; hand it again
-with tmux or re-run `ws up`.
+between loses that batch (it stays visible in the room). A task whose nudge fails stays in `tasks/`; once the
+session runs, `ws nudge SEAT a2a-...` asks it again (the file is never rewritten).
 
 **Status: a stopgap.** In the Swarma platform, delivering mail into sessions and waking them is the session host's job
 (the Swarma book, [swarma-docs](https://github.com/relux-works/swarma-docs), chapter 07; implementation
@@ -135,8 +135,8 @@ tokens (input, output, cache read, cache write), pi's own `cost.total` in USD at
 REVISION_REQUIRED, review, patch, result) and the out files.
 
 ```sh
-$WS ledger sum               # totals and rows per seat
-$WS ledger sum 2026-11-16    # one UTC day
+ws ledger sum               # totals and rows per seat
+ws ledger sum 2026-11-16    # one UTC day
 ```
 
 Compare with the provider console: pi's cost is list price and leaves out discounts and batch pricing. A row is final:
