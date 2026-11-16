@@ -18,14 +18,25 @@ SEAT_DIR/
   AGENTS.md      the seat's standing instructions (role, rules); pi reads it every turn
   tasks/<id>.md  one file per task (never overwritten)
   out/<id>-*     the seat's results: <id>-REVIEW.md (line 1 ACCEPT or REVISION_REQUIRED), <id>.patch, <id>-RESULT.md
-  sessions/      pi session files (--session-dir); `ws up` continues the last one while AGENTS.md is unchanged
-  .ws-state.json the AGENTS.md digest the running session started with
+  sessions/<id>/ one fresh pi session per task (`ws task`, the bridge); `ws up` alone continues the last one while
+                 AGENTS.md is unchanged
+  .ws-state.json the AGENTS.md digest, the current task, the bridge queue, the last alerted error
   LEDGER.jsonl   append-only work ledger (ws ledger update)
   bridge.log     what the mail bridge accepted or skipped
 ```
 
 All commands are one script, `scripts/ws` (Python 3, standard library only). Call it by its path (or the shim your
 skill manager installs); boot units call it by absolute path with `python3 -I`.
+
+To call it by a short name from any shell, define a function, not an alias: a function works the same in sh, bash and
+zsh, and in non-interactive shells where aliases are not expanded. Resolve the path once, by absolute path:
+
+```sh
+ws() { python3 -I /path/to/skill-pi-workbench/scripts/ws "$@"; }
+```
+
+Do not rely on `PATH` lookup in boot units or remote `ssh host 'cmd'` calls: they run without the login shell, so the
+function or the absolute path is the only portable form.
 
 Requirements: tmux 3.2 or newer (`new-session -e`), pi on the machine with its own auth (`/login` inside pi, or its auth file),
 and for an identity the a2a CLI ([skill-a2a](https://github.com/relux-works/skill-a2a)). Boot units get NO login shell
@@ -90,26 +101,41 @@ Check after a reboot: `ws status` (session up), `tmux ls`, `systemctl --user sta
 ## Hand a task to a seat
 
 ```sh
-ws task review-1 /path/to/<id>.md     # copied to tasks/<id>.md (exclusive), then typed into the session
+ws task review-1 /path/to/<id>.md     # copied to tasks/<id>.md (exclusive); the seat restarts with a FRESH session
 ls ~/workbench/review-1/out/<id>-*
+ws health review-1                    # ok | down (API error after the last nudge) | unknown
 ```
 
+Every task gets its own empty pi session (`sessions/<id>/`): nothing carries over from the previous task, so a
+conversation the provider refuses (for example a thinking block bound to another conversation) cannot poison later
+tasks, and a reviewer is not anchored on what it reviewed before. Because the restart ends the running session,
+`ws task` refuses while the previous task is still in flight (session up, no result in `out/` yet, pane healthy);
+wait for its result, or pass `--replace` to abandon it. A seat that is down is never busy.
+
 Write the task self-contained: repository and exact head, the files or diff, the contract (what ACCEPT means), the
-output file names, and the rules (read only, scratch-only tests). If the seat is busy, pi queues the message.
+output file names, and the rules (read only, scratch-only tests). The session has no memory of earlier tasks.
 
 ## Swarma identity and the mail bridge
 
 With `identity` set, `ws up` exports `A2A_AGENT` and `A2A_SESSION_ID` into the tmux session, so the seat itself posts
 as its identity. `ws bridge SEAT` (a boot unit) loops:
 
-1. `a2a --as ID wait --to-me-only --timeout 25m`
+1. `a2a --as ID wait --to-me-only --timeout 2m` (short, so the liveness check in step 6 runs often)
 2. `a2a --as ID inbox --json --limit 20` (this receipts exactly the printed entries)
 3. each event: type `to`, sender in `allow`, valid event id, room and topic, or it is skipped and logged
 4. a task file `tasks/a2a-<UTC stamp>-<event prefix>.md`. Everything the bridge states comes FIRST, from validated
    fields only and with POSIX shell quoting: the header, the reply command `a2a --as ID post ROOM --topic T --re EVENT
    --kind answer --to SENDER @out/<id>-RESULT.md`, an `a2a attach` fallback, and `a2a fetch` for an attachment. The
    body comes LAST, inside a fence longer than any backtick run in it, so a body cannot forge a section or a command
-5. the task is typed into the session; the seat posts its own result.
+5. the seat restarts with a fresh session for the task and the task is typed into it; the seat posts its own
+   result. If the previous task is still in flight, the new task is queued in `.ws-state.json` and started, in its
+   own fresh session, by the first pass that finds the seat free
+6. liveness: every pass runs `ws health`. When the pane shows an API error (HTTP 4xx/5xx) after the last nudge, the
+   bridge posts ONE `seat DOWN` notice per distinct error: as a reply in the task's own room, topic and event to the
+   task's sender for an a2a task, else to the optional `alert` target in the seat config
+   (`{"room": "#ops", "topic": "seats", "to": ["@dispatcher:example.org"]}`). With neither, it only logs. A seat
+   never fails silently for longer than about one pass (test `Commands.test_bridge_down_alert`: a planted 400 posts
+   once, a healthy pane posts nothing)
 
 The bridge drops `A2A_CONFIG_DIR` so it can never borrow another identity's config. A send that is addressed to the
 seat but comes from a sender not in `allow` is logged in `bridge.log` and never reaches the seat (test
@@ -145,10 +171,10 @@ to it; give a follow-up its own task id.
 
 ## Failure modes
 
-- Every request fails with `400 ... Invalid signature in thinking block ... system prompt differs`: a session was
-  continued after AGENTS.md changed. `ws up` avoids this (it starts a fresh session when the AGENTS.md digest differs
-  from `.ws-state.json`); if it happens anyway, `ws down SEAT`, remove `.ws-state.json`, `ws up SEAT`. Old session
-  files stay in `sessions/` for the ledger.
+- Every request fails with `400 ... Invalid signature in thinking block ...`: the provider refuses the continued
+  conversation. `ws health SEAT` reports `down` with the request id, and the bridge posts one `seat DOWN` notice (below).
+  Re-send the task with `ws task SEAT FILE --replace` under a new id, or start the next task: each task begins in a
+  fresh session, so the broken one is not continued. Old session files stay in `sessions/` for the ledger.
 - `can't find pane: =ws-SEAT`: a tmux pane target needs the trailing colon (`=ws-SEAT:`); `ws task` uses it.
 
 - `ws up` says the session already runs, but pi is dead: `tmux kill-session -t =ws-SEAT`, then `ws up SEAT`.
