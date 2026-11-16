@@ -220,8 +220,9 @@ class TmuxIntegration(unittest.TestCase):
     # that pane (so the pane target resolves), a second `up` is a no-op, and `down` ends the session.
     def test_up_task_down(self):
         with tempfile.TemporaryDirectory() as t:
-            env = {"TMUX_TMPDIR": os.path.join(t, "tmux"), "XDG_CONFIG_HOME": os.path.join(t, "cfg")}
-            os.makedirs(env["TMUX_TMPDIR"])
+            short = tempfile.mkdtemp(dir="/tmp")  # tmux's socket path must fit the ~104-byte unix limit on macOS
+            self.addCleanup(shutil.rmtree, short, True)
+            env = {"TMUX_TMPDIR": short, "XDG_CONFIG_HOME": os.path.join(t, "cfg")}
             old = {k: os.environ.get(k) for k in env}
             os.environ.update(env)
             os.environ.pop("TMUX", None)
