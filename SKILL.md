@@ -18,7 +18,8 @@ SEAT_DIR/
   AGENTS.md      the seat's standing instructions (role, rules); pi reads it every turn
   tasks/<id>.md  one file per task (never overwritten)
   out/<id>-*     the seat's results: <id>-REVIEW.md (line 1 ACCEPT or REVISION_REQUIRED), <id>.patch, <id>-RESULT.md
-  sessions/      pi session files (--session-dir); `ws up` continues the last one
+  sessions/      pi session files (--session-dir); `ws up` continues the last one while AGENTS.md is unchanged
+  .ws-state.json the AGENTS.md digest the running session started with
   LEDGER.jsonl   append-only work ledger (ws ledger update)
   bridge.log     what the mail bridge accepted or skipped
 ```
@@ -126,6 +127,12 @@ $WS ledger sum 2026-11-16    # one UTC day
 Compare with the provider console: pi's cost is list price and leaves out discounts and batch pricing.
 
 ## Failure modes
+
+- Every request fails with `400 ... Invalid signature in thinking block ... system prompt differs`: a session was
+  continued after AGENTS.md changed. `ws up` avoids this (it starts a fresh session when the AGENTS.md digest differs
+  from `.ws-state.json`); if it happens anyway, `ws down SEAT`, remove `.ws-state.json`, `ws up SEAT`. Old session
+  files stay in `sessions/` for the ledger.
+- `can't find pane: =ws-SEAT`: a tmux pane target needs the trailing colon (`=ws-SEAT:`); `ws task` uses it.
 
 - `ws up` says the session already runs, but pi is dead: `tmux kill-session -t =ws-SEAT`, then `ws up SEAT`.
 - After an update of this skill the script path changed: run `ws autostart SEAT` again (units hold the absolute path).

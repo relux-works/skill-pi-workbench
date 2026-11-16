@@ -163,11 +163,37 @@ def session_env(cfg):
     return env
 
 
+def agents_sha(d):
+    import hashlib
+    try:
+        with open(os.path.join(d, "AGENTS.md"), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def state_path(d):
+    return os.path.join(d, ".ws-state.json")
+
+
+def may_continue(d):
+    """Continue the last session only if AGENTS.md is unchanged since that session started: a changed system prompt
+    makes providers that bind thinking blocks to it (Anthropic) refuse every later request of the old session."""
+    sess = os.path.join(d, "sessions")
+    if not (os.path.isdir(sess) and os.listdir(sess)):
+        return False
+    try:
+        with open(state_path(d)) as f:
+            return json.load(f).get("agents_sha") == agents_sha(d)
+    except (OSError, ValueError):
+        return False
+
+
 def up_argv(seat, cfg):
     d = cfg["dir"]
     sess = os.path.join(d, "sessions")
     pi = list(cfg["pi"]) + ["--session-dir", sess]
-    if os.path.isdir(sess) and os.listdir(sess):
+    if may_continue(d):
         pi.append("-c")  # continue the seat's last session
     argv = [cfg["tmux"], "new-session", "-d", "-s", "ws-" + seat, "-c", d]
     for k, v in sorted(session_env(cfg).items()):
@@ -185,7 +211,15 @@ def cmd_up(seat):
         print("ws-%s already running" % seat)
         return 0
     os.makedirs(os.path.join(cfg["dir"], "sessions"), exist_ok=True)
-    return subprocess.run(up_argv(seat, cfg)).returncode
+    argv = up_argv(seat, cfg)
+    rc = subprocess.run(argv).returncode
+    if rc == 0:
+        tmp = state_path(cfg["dir"]) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"agents_sha": agents_sha(cfg["dir"]), "continued": shlex.split(argv[-1])[-1] == "-c",
+                       "started": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}, f)
+        os.replace(tmp, state_path(cfg["dir"]))
+    return rc
 
 
 def cmd_down(seat):
@@ -207,10 +241,15 @@ def place_task(cfg, tid, text):
 def nudge(seat, cfg, tid):
     msg = ("New task: read tasks/%s.md in full and do it exactly as AGENTS.md says. "
            "Write the results under out/ with the prefix %s." % (tid, tid))
-    t = cfg["tmux"]
-    subprocess.run([t, "send-keys", "-t", "=ws-" + seat, "-l", msg], check=True)
+    t, target = cfg["tmux"], pane_target(seat)
+    subprocess.run([t, "send-keys", "-t", target, "-l", msg], check=True)
     time.sleep(1)
-    subprocess.run([t, "send-keys", "-t", "=ws-" + seat, "Enter"], check=True)
+    subprocess.run([t, "send-keys", "-t", target, "Enter"], check=True)
+
+
+def pane_target(seat):
+    # A pane target needs the trailing colon: "=ws-SEAT" alone is not resolved as a session by send-keys.
+    return "=ws-%s:" % seat
 
 
 def cmd_task(seat, src):

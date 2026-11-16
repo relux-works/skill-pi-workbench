@@ -1,5 +1,5 @@
 """Tests for scripts/ws. Run: python3 -I -m unittest discover -s tests (from the repository root), or sh tests/run.sh."""
-import importlib.machinery, importlib.util, json, os, plistlib, shlex, stat, sys, tempfile, unittest
+import importlib.machinery, importlib.util, json, os, plistlib, shlex, shutil, stat, subprocess, sys, tempfile, time, unittest
 from datetime import datetime, timedelta, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -144,7 +144,7 @@ class Tasks(unittest.TestCase):
 
 class Up(unittest.TestCase):
     # Claim: the tmux argv names session ws-SEAT, starts in the seat dir, passes the identity env only when the seat has
-    # one, and adds pi's continue flag only when the seat already has a session file.
+    # one, and adds pi's continue flag only when the seat has a session file AND a matching AGENTS.md state.
     def test_up_argv(self):
         with tempfile.TemporaryDirectory() as t:
             c = cfg(t)
@@ -154,9 +154,32 @@ class Up(unittest.TestCase):
             self.assertIn("A2A_AGENT=host1_proj-ws_rev", a)
             self.assertFalse(shlex.split(a[-1])[-1] == "-c")
             open(os.path.join(c["dir"], "sessions", "s.jsonl"), "w").close()
+            with open(ws.state_path(c["dir"]), "w") as f:
+                json.dump({"agents_sha": ws.agents_sha(c["dir"])}, f)
             self.assertEqual(shlex.split(ws.up_argv("rev-1", c)[-1])[-1], "-c")
             c.pop("identity")
             self.assertFalse(any(x.startswith("A2A_AGENT=") for x in ws.up_argv("rev-1", c)))
+
+    # Claim: a seat continues its last session only while AGENTS.md is unchanged since that session started; any edit
+    # of AGENTS.md (or a missing state file) starts a fresh session.
+    def test_continue_only_with_same_agents_md(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = cfg(t)
+            os.makedirs(os.path.join(c["dir"], "sessions"))
+            open(os.path.join(c["dir"], "sessions", "s.jsonl"), "w").close()
+            with open(os.path.join(c["dir"], "AGENTS.md"), "w") as f:
+                f.write("v1\n")
+            self.assertFalse(ws.may_continue(c["dir"]))  # no state yet
+            with open(ws.state_path(c["dir"]), "w") as f:
+                json.dump({"agents_sha": ws.agents_sha(c["dir"])}, f)
+            self.assertEqual(shlex.split(ws.up_argv("rev-1", c)[-1])[-1], "-c")
+            with open(os.path.join(c["dir"], "AGENTS.md"), "a") as f:
+                f.write("new rule\n")
+            self.assertNotEqual(shlex.split(ws.up_argv("rev-1", c)[-1])[-1], "-c")
+
+    # Claim: task nudges address the pane as "=ws-SEAT:" (exact session, with the colon tmux needs for a pane target).
+    def test_pane_target(self):
+        self.assertEqual(ws.pane_target("rev-1"), "=ws-rev-1:")
 
     # Claim: the bridge never inherits another identity's A2A_CONFIG_DIR and always runs as the seat identity.
     def test_bridge_env(self):
@@ -168,6 +191,48 @@ class Up(unittest.TestCase):
                 os.environ.pop("A2A_CONFIG_DIR")
         self.assertNotIn("A2A_CONFIG_DIR", env)
         self.assertEqual(env["A2A_AGENT"], "host1_proj-ws_rev")
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class TmuxIntegration(unittest.TestCase):
+    # Claim: against a REAL private tmux server, `up` starts ws-SEAT, `task` places the file and types the nudge into
+    # that pane (so the pane target resolves), a second `up` is a no-op, and `down` ends the session.
+    def test_up_task_down(self):
+        with tempfile.TemporaryDirectory() as t:
+            env = {"TMUX_TMPDIR": os.path.join(t, "tmux"), "XDG_CONFIG_HOME": os.path.join(t, "cfg")}
+            os.makedirs(env["TMUX_TMPDIR"])
+            old = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            os.environ.pop("TMUX", None)
+            try:
+                seat_dir = os.path.join(t, "seat")
+                typed = os.path.join(t, "typed.txt")
+                pi = ["/bin/sh", "-c", "head -n 1 > %s; sleep 30" % shlex.quote(typed), "sh"]
+                self.assertEqual(ws.cmd_init("it-1", ["--dir", seat_dir, "--tmux", shutil.which("tmux"),
+                                                      "--a2a", "/nonexistent/a2a", "--"] + pi), 0)
+                self.assertEqual(ws.cmd_up("it-1"), 0)
+                self.assertTrue(ws.has_session("it-1", ws.load("it-1")))
+                self.assertEqual(ws.cmd_up("it-1"), 0)  # idempotent
+                task = os.path.join(t, "job-1.md")
+                with open(task, "w") as f:
+                    f.write("do it\n")
+                self.assertEqual(ws.cmd_task("it-1", task), 0)
+                for _ in range(50):
+                    if os.path.exists(typed) and os.path.getsize(typed):
+                        break
+                    time.sleep(0.1)
+                with open(typed) as f:
+                    self.assertIn("read tasks/job-1.md", f.read())
+                self.assertTrue(os.path.isfile(os.path.join(seat_dir, "tasks", "job-1.md")))
+                self.assertEqual(ws.cmd_down("it-1"), 0)
+                self.assertFalse(ws.has_session("it-1", ws.load("it-1")))
+            finally:
+                subprocess.run([shutil.which("tmux"), "kill-server"], capture_output=True)
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
 
 
 class Autostart(unittest.TestCase):
