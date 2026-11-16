@@ -1,0 +1,300 @@
+"""Tests for scripts/ws. Run: python3 -I -m unittest discover -s tests (from the repository root), or sh tests/run.sh."""
+import importlib.machinery, importlib.util, json, os, plistlib, shlex, stat, sys, tempfile, unittest
+from datetime import datetime, timedelta, timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_loader = importlib.machinery.SourceFileLoader("ws", os.path.join(ROOT, "scripts", "ws"))
+_spec = importlib.util.spec_from_loader("ws", _loader)
+ws = importlib.util.module_from_spec(_spec)
+_loader.exec_module(ws)
+
+ALICE = "@alice:example.org"
+MALLORY = "@mallory:example.org"
+
+
+def cfg(tmp, **kw):
+    c = {"dir": os.path.join(tmp, "seat"), "pi": ["/usr/local/bin/pi-wrapper", "--thinking", "xhigh"], "allow": [ALICE],
+         "a2a": "/opt/a2a/bin/a2a", "tmux": "/usr/bin/tmux", "identity": "host1_proj-ws_rev", "role": "rev",
+         "project": "proj-ws"}
+    c.update(kw)
+    return c
+
+
+def event(**kw):
+    e = {"type": "to", "sender": ALICE, "event_id": "$AbCdEfGh12345678", "room": "#lobby", "topic": "ops-1",
+         "kind": "request", "body": "do the thing"}
+    e.update(kw)
+    return json.dumps(e)
+
+
+class ConfigValidation(unittest.TestCase):
+    # Claim: validate() accepts a complete config and refuses each malformed field on its own (one change per case).
+    def test_positive_control(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(ws.validate(cfg(t))["identity"], "host1_proj-ws_rev")
+
+    def test_refusals(self):
+        with tempfile.TemporaryDirectory() as t:
+            bad = [dict(dir="relative/seat"), dict(pi=["pi"]), dict(pi=[]), dict(allow=["alice"]),
+                   dict(allow=["@alice:example.org;rm"]), dict(identity="Bad Id"), dict(role=None),
+                   dict(a2a="a2a"), dict(tmux="tmux"), dict(extra=1)]
+            for change in bad:
+                with self.subTest(change=change):
+                    with self.assertRaises(ws.Refused):
+                        ws.validate(cfg(t, **change))
+
+    # Claim: a seat without an identity needs no role or project (the bridge and identity commands then refuse).
+    def test_no_identity_is_valid(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = cfg(t)
+            for k in ("identity", "role", "project"):
+                c.pop(k)
+            self.assertIsNone(ws.validate(c).get("identity"))
+
+    # Claim: seat names outside [a-z0-9-] are refused before any path is built from them.
+    def test_seat_names(self):
+        self.assertTrue(ws.seat_path("review-1").endswith("review-1.json"))
+        for s in ("../x", "A", "", "a/b", "-x"):
+            with self.subTest(seat=s), self.assertRaises(ws.Refused):
+                ws.seat_path(s)
+
+
+class Ingest(unittest.TestCase):
+    NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    # Claim: an addressed event from an allow-listed sender becomes ONE task whose reply command, parsed by a POSIX
+    # shell, is exactly the expected argv (identity, room, topic, event, sender localpart, result file).
+    def test_allowed_event_reply_argv(self):
+        with tempfile.TemporaryDirectory() as t:
+            tasks, skipped = ws.ingest([event()], cfg(t), now=self.NOW)
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(tasks), 1)
+        tid, text = tasks[0]
+        self.assertEqual(tid, "a2a-0102T030405-AbCdEfGh")
+        post = [l.strip() for l in text.splitlines() if l.startswith("    ") and " post " in l][0]
+        self.assertEqual(shlex.split(post), ["/opt/a2a/bin/a2a", "--as", "host1_proj-ws_rev", "post", "#lobby", "--topic",
+                                             "ops-1", "--re", "$AbCdEfGh12345678", "--kind", "answer", "--to", "alice",
+                                             "@out/%s-RESULT.md" % tid])
+
+    # Claim: shell metacharacters in the BODY stay inside the task text and never change the reply argv.
+    def test_body_cannot_change_reply(self):
+        with tempfile.TemporaryDirectory() as t:
+            tasks, _ = ws.ingest([event(body="x'; rm -rf ~; echo '$(id)`id`")], cfg(t), now=self.NOW)
+        tid, text = tasks[0]
+        self.assertIn("rm -rf ~", text.split("## Reply")[0])
+        post = [l.strip() for l in text.split("## Reply")[1].splitlines() if l.startswith("    ") and " post " in l][0]
+        self.assertEqual(shlex.split(post)[-1], "@out/%s-RESULT.md" % tid)
+        self.assertNotIn("rm", post)
+
+    # Claim: each refusal reason drops the event (no task), and the unchanged event beside it is accepted, so the filter
+    # is not a reject-all.
+    def test_refusals_with_control(self):
+        cases = {"not addressed": event(type="sub"), "mention only": event(type="mention"),
+                 "foreign sender": event(sender=MALLORY), "spoofed display name": event(sender="@alice:evil.example"),
+                 "bad event": event(event_id="$x;y"), "short event": event(event_id="$abc"),
+                 "bad room": event(room="#lobby; rm -rf /"), "bad topic": event(topic="a b"),
+                 "not json": "{nope", "not an object": "[1,2]"}
+        with tempfile.TemporaryDirectory() as t:
+            for name, line in cases.items():
+                with self.subTest(case=name):
+                    tasks, skipped = ws.ingest([line, event()], cfg(t), now=self.NOW)
+                    self.assertEqual(len(tasks), 1, name)  # only the control
+                    self.assertEqual(len(skipped), 1, name)
+
+    # Claim: with an EMPTY allow list nothing is accepted, even a well-formed addressed event.
+    def test_empty_allow_list(self):
+        with tempfile.TemporaryDirectory() as t:
+            tasks, skipped = ws.ingest([event()], cfg(t, allow=[]), now=self.NOW)
+        self.assertEqual((tasks, len(skipped)), ([], 1))
+
+    # Claim: an attachment adds the exact fetch argv; an event without a topic gets no attach fallback line.
+    def test_attachment_and_no_topic(self):
+        with tempfile.TemporaryDirectory() as t:
+            (tid, text), = ws.ingest([event(attachment={"name": "a.tgz"}, topic="")], cfg(t), now=self.NOW)[0]
+        fetch = [l.strip() for l in text.splitlines() if l.startswith("    ") and " fetch " in l][0]
+        self.assertEqual(shlex.split(fetch), ["/opt/a2a/bin/a2a", "--as", "host1_proj-ws_rev", "fetch", "#lobby",
+                                              "$AbCdEfGh12345678", "-o", "tasks/%s-attachment" % tid])
+        self.assertNotIn(" attach ", text)
+        self.assertNotIn("--topic", text)
+
+
+class Tasks(unittest.TestCase):
+    # Claim: place_task never overwrites an existing task and never follows a symlink planted at the task name; a new
+    # name is written (control).
+    def test_exclusive_and_nofollow(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = cfg(t)
+            os.makedirs(os.path.join(c["dir"], "tasks"))
+            p = ws.place_task(c, "t1", "one")
+            with self.assertRaises(FileExistsError):
+                ws.place_task(c, "t1", "two")
+            with open(p) as f:
+                self.assertEqual(f.read(), "one")
+            victim = os.path.join(t, "victim")
+            with open(victim, "w") as f:
+                f.write("keep")
+            os.symlink(victim, os.path.join(c["dir"], "tasks", "t2.md"))
+            with self.assertRaises(OSError):
+                ws.place_task(c, "t2", "evil")
+            with open(victim) as f:
+                self.assertEqual(f.read(), "keep")
+            with self.assertRaises(ws.Refused):
+                ws.place_task(c, "../escape", "x")
+
+
+class Up(unittest.TestCase):
+    # Claim: the tmux argv names session ws-SEAT, starts in the seat dir, passes the identity env only when the seat has
+    # one, and adds pi's continue flag only when the seat already has a session file.
+    def test_up_argv(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = cfg(t)
+            os.makedirs(os.path.join(c["dir"], "sessions"))
+            a = ws.up_argv("rev-1", c)
+            self.assertEqual(a[:6], ["/usr/bin/tmux", "new-session", "-d", "-s", "ws-rev-1", "-c"])
+            self.assertIn("A2A_AGENT=host1_proj-ws_rev", a)
+            self.assertFalse(shlex.split(a[-1])[-1] == "-c")
+            open(os.path.join(c["dir"], "sessions", "s.jsonl"), "w").close()
+            self.assertEqual(shlex.split(ws.up_argv("rev-1", c)[-1])[-1], "-c")
+            c.pop("identity")
+            self.assertFalse(any(x.startswith("A2A_AGENT=") for x in ws.up_argv("rev-1", c)))
+
+    # Claim: the bridge never inherits another identity's A2A_CONFIG_DIR and always runs as the seat identity.
+    def test_bridge_env(self):
+        with tempfile.TemporaryDirectory() as t:
+            os.environ["A2A_CONFIG_DIR"] = "/elsewhere"
+            try:
+                env = ws.bridge_env(cfg(t))
+            finally:
+                os.environ.pop("A2A_CONFIG_DIR")
+        self.assertNotIn("A2A_CONFIG_DIR", env)
+        self.assertEqual(env["A2A_AGENT"], "host1_proj-ws_rev")
+
+
+class Autostart(unittest.TestCase):
+    # Claim: Linux units run `python -I ws up|down|bridge|ledger` by absolute paths; the bridge unit exists only for a
+    # seat with an identity; the ledger runs from a timer.
+    def test_linux_units(self):
+        with tempfile.TemporaryDirectory() as t:
+            u = ws.linux_units("rev-1", cfg(t), "/skills/ws", "/usr/bin/python3", t)
+            names = sorted(os.path.basename(p) for p in u)
+            self.assertEqual(names, ["pi-workbench-bridge-rev-1.service", "pi-workbench-ledger.service",
+                                     "pi-workbench-ledger.timer", "pi-workbench-rev-1.service"])
+            main = [c for p, c in u.items() if p.endswith("pi-workbench-rev-1.service")][0]
+            self.assertIn("ExecStart=/usr/bin/python3 -I /skills/ws up rev-1", main)
+            self.assertIn("ExecStop=/usr/bin/python3 -I /skills/ws down rev-1", main)
+            c = cfg(t)
+            c.pop("identity")
+            self.assertFalse(any("bridge" in p for p in ws.linux_units("rev-1", c, "/skills/ws", "/usr/bin/python3", t)))
+
+    # Claim: macOS LaunchAgents are valid plists; the seat agent runs once at load, the bridge is kept alive only after
+    # a failed exit, and the ledger runs every 600 s.
+    def test_mac_units(self):
+        with tempfile.TemporaryDirectory() as t:
+            u = ws.mac_units("rev-1", cfg(t), "/skills/ws", "/usr/bin/python3", t)
+            parsed = {os.path.basename(p): plistlib.loads(c.encode()) for p, c in u.items()}
+            seat = parsed["local.pi-workbench.rev-1.plist"]
+            self.assertEqual(seat["ProgramArguments"], ["/usr/bin/python3", "-I", "/skills/ws", "up", "rev-1"])
+            self.assertTrue(seat["RunAtLoad"])
+            self.assertNotIn("KeepAlive", seat)
+            self.assertEqual(parsed["local.pi-workbench.bridge.rev-1.plist"]["KeepAlive"], {"SuccessfulExit": False})
+            self.assertEqual(parsed["local.pi-workbench.ledger.plist"]["StartInterval"], 600)
+
+
+def write_session(path, entries):
+    with open(path, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
+def msg(ts, role, text=None, usage=None):
+    m = {"role": role}
+    if text is not None:
+        m["content"] = [{"type": "text", "text": text}]
+    if usage:
+        m.update(usage=usage, model="model-x", provider="prov")
+    return {"type": "message", "timestamp": ts, "message": m}
+
+
+USAGE = {"input": 10, "output": 100, "cacheRead": 1000, "cacheWrite": 50, "cost": {"total": 0.25}}
+
+
+class Ledger(unittest.TestCase):
+    def seat(self, t):
+        c = cfg(t)
+        for s in ("sessions", "out", "tasks"):
+            os.makedirs(os.path.join(c["dir"], s))
+        write_session(os.path.join(c["dir"], "sessions", "2026-01-01.jsonl"), [
+            {"type": "session", "timestamp": "2026-01-01T00:00:00Z"},
+            {"type": "model_change", "modelId": "model-x", "provider": "prov", "timestamp": "2026-01-01T00:00:00Z"},
+            {"type": "thinking_level_change", "thinkingLevel": "xhigh", "timestamp": "2026-01-01T00:00:00Z"},
+            msg("2026-01-01T01:00:00Z", "user", "New task: read tasks/t1.md in full"),
+            msg("2026-01-01T01:05:00Z", "assistant", usage=USAGE),
+            msg("2026-01-01T01:10:00Z", "assistant", usage=USAGE),
+            msg("2026-01-01T02:00:00Z", "user", "New task: read tasks/t2.md in full"),
+            msg("2026-01-01T02:03:00Z", "assistant", usage=USAGE),
+            msg("2026-01-01T03:00:00Z", "user", "New task: read tasks/t3.md in full"),
+            msg("2026-01-01T03:01:00Z", "assistant", usage=USAGE)])
+        with open(os.path.join(c["dir"], "out", "t1-REVIEW.md"), "w") as f:
+            f.write("ACCEPT\nfine\n")
+        with open(os.path.join(c["dir"], "out", "t2.patch"), "w") as f:
+            f.write("diff\n")
+        with open(os.path.join(c["dir"], "tasks", "t2.md"), "w") as f:
+            f.write("# Task\nFrom @alice:example.org in #lobby\n")
+        return c
+
+    # Claim: tokens and cost are summed per task span from pi's own usage records, the outcome comes from the out/
+    # files, the requester from the task file, and a task with no out/ file yet (t3) is not recorded.
+    def test_update_rows(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = self.seat(t)
+            rows = ws.ledger_update("rev-1", c, now=datetime(2026, 1, 1, 4, tzinfo=timezone.utc))
+            self.assertEqual([r["task"] for r in rows], ["t1", "t2"])
+            r1, r2 = rows
+            self.assertEqual((r1["input"], r1["output"], r1["cache_read"], r1["cache_write"], r1["turns"]), (20, 200, 2000, 100, 2))
+            self.assertEqual((r1["cost_usd"], r1["outcome"], r1["wall_min"], r1["thinking"]), (0.5, "ACCEPT", 10.0, "xhigh"))
+            self.assertEqual((r2["outcome"], r2["requester"]), ("patch", ALICE))
+            self.assertEqual(r1["requester"], "local (ws task)")
+
+    # Claim: update is append-only and idempotent: a second run adds no row; a span still active (ended < settle ago)
+    # waits for a later run.
+    def test_idempotent_and_settle(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = self.seat(t)
+            early = ws.ledger_update("rev-1", c, now=datetime(2026, 1, 1, 2, 4, tzinfo=timezone.utc))
+            self.assertEqual([r["task"] for r in early], ["t1"])  # t2 ended 1 min before: not settled
+            later = ws.ledger_update("rev-1", c, now=datetime(2026, 1, 1, 4, tzinfo=timezone.utc))
+            self.assertEqual([r["task"] for r in later], ["t2"])
+            self.assertEqual(ws.ledger_update("rev-1", c, now=datetime(2026, 1, 1, 5, tzinfo=timezone.utc)), [])
+            tot, rows = ws.ledger_sum("rev-1", c)
+            self.assertEqual((tot["tasks"], tot["cost_usd"]), (2, 0.75))
+            self.assertEqual(ws.ledger_sum("rev-1", c, "2025-12-31")[0]["tasks"], 0)
+
+
+class InitAndMain(unittest.TestCase):
+    # Claim: init writes a 0600 config and the seat layout, refuses to replace a seat without --force, and the CLI
+    # refuses unknown commands and bad seat names with exit 2.
+    def test_init_and_cli(self):
+        with tempfile.TemporaryDirectory() as t:
+            os.environ["XDG_CONFIG_HOME"] = os.path.join(t, "cfg")
+            try:
+                args = ["--dir", os.path.join(t, "seat"), "--identity", "h_p_rev", "--role", "rev", "--project", "p",
+                        "--allow", ALICE, "--a2a", "/opt/a2a", "--tmux", "/usr/bin/tmux", "--", "/usr/local/bin/pi-wrapper", "-x"]
+                self.assertEqual(ws.cmd_init("rev-1", list(args)), 0)
+                p = ws.seat_path("rev-1")
+                self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+                for s in ("tasks", "out", "sessions", "AGENTS.md"):
+                    self.assertTrue(os.path.exists(os.path.join(t, "seat", s)), s)
+                with open(os.path.join(t, "seat", "AGENTS.md")) as f:
+                    self.assertIn("h_p_rev", f.read())
+                with self.assertRaises(ws.Refused):
+                    ws.cmd_init("rev-1", list(args))
+                self.assertEqual(ws.cmd_init("rev-1", ["--force"] + args), 0)
+                self.assertEqual(ws.seats(), ["rev-1"])
+                self.assertEqual(ws.main(["ws", "nosuch", "rev-1"]), 2)
+                self.assertEqual(ws.main(["ws", "up", "../x"]), 2)
+            finally:
+                os.environ.pop("XDG_CONFIG_HOME")
+
+
+if __name__ == "__main__":
+    unittest.main()

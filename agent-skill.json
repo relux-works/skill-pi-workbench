@@ -1,0 +1,12 @@
+{
+  "schema_version": 7,
+  "capabilities": {
+    "network": []
+  },
+  "commands": {
+    "ws": {
+      "type": "script",
+      "unix_path": "scripts/ws"
+    }
+  }
+}
