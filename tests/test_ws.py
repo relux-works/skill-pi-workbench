@@ -7,6 +7,7 @@ _loader = importlib.machinery.SourceFileLoader("ws", os.path.join(ROOT, "scripts
 _spec = importlib.util.spec_from_loader("ws", _loader)
 ws = importlib.util.module_from_spec(_spec)
 _loader.exec_module(ws)
+ws.START_WAIT = 0  # the fresh-session pause is for a real pi; the stubs answer at once
 
 ALICE = "@alice:example.org"
 MALLORY = "@mallory:example.org"
@@ -395,26 +396,92 @@ class Commands(unittest.TestCase):
         self.assertEqual(ws.cmd_init("s-1", args), 0)
         return ws.load("s-1"), log
 
-    # Claim: `ws task` refuses while the session is down and then writes NO task file; with the session up the file is
-    # written and the nudge targets "=ws-SEAT:" (control); a second send of the same id is refused, not overwritten.
-    def test_task_needs_session(self):
-        with tempfile.TemporaryDirectory() as t:
-            c, log = self.seat(t, tmux_rc='case "$1" in has-session) exit 1;; esac; exit 0')
-            src = os.path.join(t, "job-1.md")
-            with open(src, "w") as f:
-                f.write("x\n")
-            self.assertEqual(ws.main(["ws", "task", "s-1", src]), 2)
-            self.assertFalse(os.path.exists(os.path.join(c["dir"], "tasks", "job-1.md")))
-        with tempfile.TemporaryDirectory() as t:
-            c, log = self.seat(t)
-            src = os.path.join(t, "job-1.md")
-            with open(src, "w") as f:
-                f.write("x\n")
-            self.assertEqual(ws.main(["ws", "task", "s-1", src]), 0)
-            self.assertTrue(os.path.exists(os.path.join(c["dir"], "tasks", "job-1.md")))
-            with open(log) as f:
-                self.assertIn("send-keys -t =ws-s-1: -l New task: read tasks/job-1.md", f.read())
-            self.assertEqual(ws.main(["ws", "task", "s-1", src]), 2)
+    # Claim: `ws task` starts the task in a FRESH pi session: the seat is (re)started with --session-dir
+    # sessions/TASK and without -c, whether its session was down or up (an up session is killed first), and the nudge
+    # targets "=ws-SEAT:"; a second send of the same id is refused and the file is not overwritten.
+    def test_task_fresh_session(self):
+        for up in (False, True):
+            with tempfile.TemporaryDirectory() as t:
+                rc = 'exit 0' if up else 'case "$1" in has-session) exit 1;; esac; exit 0'
+                c, log = self.seat(t, tmux_rc=rc)
+                os.makedirs(os.path.join(c["dir"], "sessions", "old"), exist_ok=True)  # a previous session exists
+                src = os.path.join(t, "job-1.md")
+                with open(src, "w") as f:
+                    f.write("x\n")
+                self.assertEqual(ws.main(["ws", "task", "s-1", src]), 0)
+                self.assertTrue(os.path.exists(os.path.join(c["dir"], "tasks", "job-1.md")))
+                with open(log) as f:
+                    calls = f.read()
+                new = [l for l in calls.splitlines() if l.startswith("new-session")]
+                self.assertEqual(len(new), 1, calls)
+                self.assertIn("--session-dir %s" % os.path.join(c["dir"], "sessions", "job-1"), new[0])
+                self.assertFalse(new[0].rstrip().endswith(" -c"), new[0])
+                self.assertEqual("kill-session -t =ws-s-1" in calls, up)
+                self.assertIn("send-keys -t =ws-s-1: -l New task: read tasks/job-1.md", calls)
+                self.assertEqual(ws.read_state(c["dir"]).get("task"), "job-1")
+                with open(src, "w") as f:
+                    f.write("changed\n")
+                self.assertEqual(ws.main(["ws", "task", "s-1", src]), 2)
+                with open(os.path.join(c["dir"], "tasks", "job-1.md")) as f:
+                    self.assertEqual(f.read(), "x\n")
+
+    # Claim: while the previous task is in flight (session up, no result in out/, pane healthy) a new `ws task` is
+    # refused and writes no task file; it is accepted once the previous task has a result, once the pane shows an
+    # API error (a dead seat is never busy), or with --replace (three positive controls).
+    def test_task_busy_guard(self):
+        for case in ("busy", "result", "down", "replace"):
+            with tempfile.TemporaryDirectory() as t:
+                pane = os.path.join(t, "pane.txt")
+                with open(pane, "w") as f:
+                    f.write(ws.NUDGE_MARK + "job-1.md\n" + ("Error: 400 {\"request_id\":\"req_x1\"}\n" if case == "down" else "Working...\n"))
+                c, log = self.seat(t, tmux_rc='case "$1" in capture-pane) cat %s;; esac; exit 0' % shlex.quote(pane))
+                ws.write_state(c["dir"], {"task": "job-1"})
+                if case == "result":
+                    with open(os.path.join(c["dir"], "out", "job-1-REVIEW.md"), "w") as f:
+                        f.write("ACCEPT\n")
+                src = os.path.join(t, "job-2.md")
+                with open(src, "w") as f:
+                    f.write("y\n")
+                argv = ["ws", "task", "s-1", src] + (["--replace"] if case == "replace" else [])
+                want = 2 if case == "busy" else 0
+                self.assertEqual(ws.main(argv), want, case)
+                self.assertEqual(os.path.exists(os.path.join(c["dir"], "tasks", "job-2.md")), want == 0, case)
+
+    # Claim: health() is "down" with the HTTP status and request id when the pane shows an API error AFTER the last
+    # task nudge; an error from before the last nudge, or a pane with no error, is "ok" (controls); no pane is unknown.
+    def test_health(self):
+        err = 'Error: 400\n{"type":"error","error":{"message":"x"},"request_id":"req_011Ab"}\n'
+        self.assertEqual(ws.health(ws.NUDGE_MARK + "t1.md\n" + err), ("down", "HTTP 400 request_id req_011Ab"))
+        self.assertEqual(ws.health(ws.NUDGE_MARK + "t1.md\nError: 529 overloaded\n"), ("down", "HTTP 529"))
+        self.assertEqual(ws.health(err + ws.NUDGE_MARK + "t2.md\nWorking...\n"), ("ok", None))
+        self.assertEqual(ws.health(ws.NUDGE_MARK + "t2.md\nall good, 400 lines read\n"), ("ok", None))
+        self.assertEqual(ws.health(None)[0], "unknown")
+
+    # Claim: a bridge pass posts exactly ONE "seat DOWN" notice per new API error, as a reply in the a2a task's own
+    # room, topic and event to its sender; a second pass with the same error posts nothing more, and a healthy pane
+    # posts nothing (control).
+    def test_bridge_down_alert(self):
+        for healthy in (False, True):
+            with tempfile.TemporaryDirectory() as t:
+                pane, posts = os.path.join(t, "pane.txt"), os.path.join(t, "posts.log")
+                tid = "a2a-1116T090000-AbCdEfGh"
+                with open(pane, "w") as f:
+                    f.write(ws.NUDGE_MARK + tid + ".md\n" + ("ok\n" if healthy else 'Error: 400 {"request_id":"req_dead1"}\n'))
+                c, log = self.seat(t, tmux_rc='case "$1" in capture-pane) cat %s;; esac; exit 0' % shlex.quote(pane),
+                                   a2a='case "$3" in post) echo "$@" >> %s;; esac; exit 0' % shlex.quote(posts))
+                text = ws.ingest([event()], c, now=datetime(2026, 11, 16, 9, tzinfo=timezone.utc))[0][0][1]
+                ws.place_task(c, tid, text)
+                ws.write_state(c["dir"], {"task": tid})
+                logged = []
+                ws.bridge_pass("s-1", c, logged.append)
+                ws.bridge_pass("s-1", c, logged.append)
+                sent = open(posts).read().splitlines() if os.path.exists(posts) else []
+                if healthy:
+                    self.assertEqual(sent, [])
+                else:
+                    self.assertEqual(len(sent), 1, sent)
+                    self.assertIn("post #lobby --topic ops-1 --re $AbCdEfGh12345678 --kind notice --to alice", sent[0])
+                    self.assertIn("seat DOWN: ws-s-1 stopped working on task %s (HTTP 400 request_id req_dead1)" % tid, sent[0])
 
     # Claim: one bridge pass delivers the allow-listed addressed event as a task and nudges the seat, while a
     # well-formed addressed event from a NON-allow-listed sender produces no task and is logged as skipped.

@@ -5,9 +5,15 @@
                           write the seat config and create DIR/{tasks,out,sessions} and DIR/AGENTS.md
   ws up SEAT              start tmux session ws-SEAT (idempotent); continues the seat's last pi session
   ws down SEAT            stop tmux session ws-SEAT
-  ws task SEAT FILE       copy FILE into SEAT/tasks/ (never overwrites) and ask the session to do it
+  ws task SEAT FILE [--replace]
+                          copy FILE into SEAT/tasks/ (never overwrites), restart ws-SEAT with a FRESH pi session for
+                          this task (sessions/ID/), and ask it to do the task; refuses while the previous task is still
+                          running and healthy, unless --replace
   ws nudge SEAT ID        ask the session again to do tasks/ID.md (already placed, for example by the bridge)
-  ws bridge SEAT          loop: a2a mail ADDRESSED to the seat identity from allow-listed senders becomes a task
+  ws health SEAT          ok | down | unknown: down when the pane shows an API error (HTTP 4xx/5xx) after the last
+                          task nudge; exit 0 ok, 3 down, 2 unknown
+  ws bridge SEAT          loop: a2a mail ADDRESSED to the seat identity from allow-listed senders becomes a task;
+                          every pass also checks health and posts one "seat DOWN" notice per new API error
   ws identity SEAT        create or refresh the seat's a2a identity (a2a identity ensure), print the next steps
   ws autostart SEAT [--dry-run] [--remove]
                           boot units: systemd --user on Linux, LaunchAgents on macOS
@@ -31,7 +37,11 @@ EVENT_RE = re.compile(r"^\$[A-Za-z0-9_+/=-]{8,200}\Z")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 KIND_RE = re.compile(r"^[a-z][a-z_-]{0,31}\Z")
 TASK_REF_RE = re.compile(r"tasks/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\.md")
-KEYS = {"dir", "pi", "identity", "role", "project", "allow", "a2a", "tmux", "path"}
+KEYS = {"dir", "pi", "identity", "role", "project", "allow", "a2a", "tmux", "path", "alert"}
+API_ERROR_RE = re.compile(r"\bError: ([45][0-9]{2})\b")
+REQUEST_ID_RE = re.compile(r"\"request_id\"\s*:\s*\"([A-Za-z0-9_-]{4,100})\"")
+NUDGE_MARK = "New task: read tasks/"
+START_WAIT = 5  # seconds for a fresh pi session to reach its prompt before the nudge is typed
 DEFAULT_PATH = "~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 LABEL = "local.pi-workbench"
 
@@ -78,6 +88,15 @@ def validate(cfg):
     for k in ("a2a", "tmux"):
         need(isinstance(cfg.get(k), str) and os.path.isabs(cfg[k]), "%s must be an absolute path" % k)
     need(isinstance(cfg.get("path", DEFAULT_PATH), str), "path must be a string")
+    alert = cfg.get("alert")
+    if alert is not None:
+        need(isinstance(alert, dict) and set(alert) <= {"room", "topic", "to"}, "alert must be {room, topic, to}")
+        need(isinstance(alert.get("room"), str) and ROOM_RE.match(alert["room"]), "alert.room must be a room")
+        need(alert.get("topic") is None or (isinstance(alert["topic"], str) and TOPIC_RE.match(alert["topic"])),
+             "bad alert.topic")
+        to = alert.get("to", [])
+        need(isinstance(to, list) and all(isinstance(m, str) and MXID_RE.match(m) for m in to),
+             "alert.to must list exact Matrix IDs")
     return cfg
 
 
@@ -193,11 +212,13 @@ def may_continue(d):
         return False
 
 
-def up_argv(seat, cfg):
+def up_argv(seat, cfg, fresh=None):
+    """With fresh=TASK_ID the session starts empty in sessions/TASK_ID (never continued): one session per task, so
+    a broken or provider-bound conversation can never carry over, and a reviewer is not anchored on its last task."""
     d = cfg["dir"]
-    sess = os.path.join(d, "sessions")
+    sess = os.path.join(d, "sessions", fresh) if fresh else os.path.join(d, "sessions")
     pi = list(cfg["pi"]) + ["--session-dir", sess]
-    if may_continue(d):
+    if not fresh and may_continue(d):
         pi.append("-c")  # continue the seat's last session
     argv = [cfg["tmux"], "new-session", "-d", "-s", "ws-" + seat, "-c", d]
     for k, v in sorted(session_env(cfg).items()):
@@ -209,21 +230,77 @@ def has_session(seat, cfg):
     return subprocess.run([cfg["tmux"], "has-session", "-t", "=ws-" + seat], capture_output=True).returncode == 0
 
 
+def read_state(d):
+    try:
+        with open(state_path(d)) as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(d, state):
+    tmp = state_path(d) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, state_path(d))
+
+
+def start(seat, cfg, fresh=None):
+    sess = os.path.join(cfg["dir"], "sessions", fresh) if fresh else os.path.join(cfg["dir"], "sessions")
+    os.makedirs(sess, exist_ok=True)
+    argv = up_argv(seat, cfg, fresh)
+    rc = subprocess.run(argv).returncode
+    if rc == 0:
+        state = read_state(cfg["dir"])  # keeps the bridge queue across restarts
+        state.update(agents_sha=agents_sha(cfg["dir"]), continued=shlex.split(argv[-1])[-1] == "-c",
+                     started=utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+        if fresh:
+            state["task"] = fresh
+        write_state(cfg["dir"], state)
+    return rc
+
+
 def cmd_up(seat):
     cfg = load(seat)
     if has_session(seat, cfg):
         print("ws-%s already running" % seat)
         return 0
-    os.makedirs(os.path.join(cfg["dir"], "sessions"), exist_ok=True)
-    argv = up_argv(seat, cfg)
-    rc = subprocess.run(argv).returncode
-    if rc == 0:
-        tmp = state_path(cfg["dir"]) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"agents_sha": agents_sha(cfg["dir"]), "continued": shlex.split(argv[-1])[-1] == "-c",
-                       "started": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}, f)
-        os.replace(tmp, state_path(cfg["dir"]))
-    return rc
+    return start(seat, cfg)
+
+
+def pane_text(seat, cfg, lines=300):
+    p = subprocess.run([cfg["tmux"], "capture-pane", "-p", "-J", "-S", "-%d" % lines, "-t", pane_target(seat)],
+                       capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def health(text):
+    """Pure: ("ok"|"down"|"unknown", detail). The seat is down when its pane shows an API error (HTTP 4xx/5xx) after
+    the last task nudge it was given; detail names the status and the provider request id when one is printed."""
+    if text is None:
+        return "unknown", "pane not readable"
+    mark = text.rfind(NUDGE_MARK)
+    tail = text[mark:] if mark >= 0 else text
+    errors = list(API_ERROR_RE.finditer(tail))
+    if not errors:
+        return "ok", None
+    last = errors[-1]
+    rid = REQUEST_ID_RE.search(tail, last.start())
+    return "down", "HTTP %s%s" % (last.group(1), (" request_id " + rid.group(1)) if rid else "")
+
+
+def seat_health(seat, cfg):
+    if not has_session(seat, cfg):
+        return "unknown", "ws-%s is not running" % seat
+    return health(pane_text(seat, cfg))
+
+
+def cmd_health(seat):
+    cfg = load(seat)
+    state, detail = seat_health(seat, cfg)
+    print("ws-%s: %s%s" % (seat, state, (" (%s)" % detail) if detail else ""))
+    return {"ok": 0, "down": 3}.get(state, 2)
 
 
 def cmd_down(seat):
@@ -268,18 +345,41 @@ def cmd_nudge(seat, tid):
     return 0
 
 
-def cmd_task(seat, src):
+def busy(seat, cfg):
+    """The task the seat is still on, or None: a task is in flight while its session runs, it has no result in out/
+    yet and the pane shows no API error. A dead (down) seat is never busy."""
+    prev = read_state(cfg["dir"]).get("task")
+    if not prev or not has_session(seat, cfg) or outcome(cfg["dir"], prev)[0] is not None:
+        return None
+    return None if seat_health(seat, cfg)[0] == "down" else prev
+
+
+def launch(seat, cfg, tid):
+    """Restart ws-SEAT with a fresh, empty pi session for tid, then ask it to do the task."""
+    if has_session(seat, cfg):
+        subprocess.run([cfg["tmux"], "kill-session", "-t", "=ws-" + seat], check=True)
+    need(start(seat, cfg, fresh=tid) == 0, "could not start ws-%s" % seat)
+    time.sleep(START_WAIT)
+    nudge(seat, cfg, tid)
+
+
+def cmd_task(seat, src, replace=False):
     cfg = load(seat)
     need(os.path.isfile(src), "no such task file %s" % src)
     tid = os.path.basename(src)[:-3] if src.endswith(".md") else os.path.basename(src)
-    need(has_session(seat, cfg), "ws-%s is not running (ws up %s)" % (seat, seat))
+    need(TASK_ID_RE.match(tid), "bad task id %r" % tid)
+    need(not os.path.lexists(os.path.join(cfg["dir"], "tasks", tid + ".md")),
+         "task %s already exists in %s/tasks (task files are never overwritten)" % (tid, seat))
+    prev = None if replace else busy(seat, cfg)
+    need(prev is None, "ws-%s is still on task %s (no result in out/ yet, seat healthy); wait, or pass --replace"
+         % (seat, prev))
     with open(src) as f:
         try:
             place_task(cfg, tid, f.read())
         except FileExistsError:
             raise Refused("task %s already exists in %s/tasks (task files are never overwritten)" % (tid, seat))
-    nudge(seat, cfg, tid)
-    print("sent %s to %s; results: %s/out/%s-*" % (tid, seat, cfg["dir"], tid))
+    launch(seat, cfg, tid)
+    print("sent %s to %s in a fresh session; results: %s/out/%s-*" % (tid, seat, cfg["dir"], tid))
     return 0
 
 
@@ -368,7 +468,8 @@ def cmd_bridge(seat, once=False):
             f.write("%s %s\n" % (utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), msg))
 
     while True:
-        w = subprocess.run([a2a, "--as", ident, "wait", "--to-me-only", "--timeout", "25m"], env=bridge_env(cfg),
+        # A short wait keeps the liveness check below at most about two minutes behind a dead seat.
+        w = subprocess.run([a2a, "--as", ident, "wait", "--to-me-only", "--timeout", "2m"], env=bridge_env(cfg),
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if w.returncode != 0:  # a2a wait exits 0 on mail AND on timeout (it prints "timeout"); other codes are errors
             log("wait rc=%d %s" % (w.returncode, (w.stderr or "").strip()[:300]))
@@ -388,12 +489,81 @@ def cmd_bridge(seat, once=False):
             for tid, text in tasks:
                 try:
                     place_task(cfg, tid, text)
-                    nudge(seat, cfg, tid)
-                    log("task %s delivered" % tid)
+                    prev = busy(seat, cfg)
+                    if prev:
+                        st = read_state(d)
+                        st["queue"] = st.get("queue", []) + [tid]
+                        write_state(d, st)
+                        log("task %s queued behind %s" % (tid, prev))
+                    else:
+                        launch(seat, cfg, tid)
+                        log("task %s delivered in a fresh session" % tid)
                 except (OSError, subprocess.CalledProcessError, Refused) as e:
                     log("task %s NOT delivered: %s" % (tid, e))
+        try:
+            bridge_pass(seat, cfg, log)
+        except (OSError, subprocess.CalledProcessError, Refused) as e:
+            log("liveness/queue pass failed: %s" % e)
         if once:
             return 0
+
+
+def task_origin(seat_dir, tid):
+    """(sender, room, topic, event) from the header the bridge wrote into an a2a task, else None."""
+    p = os.path.join(seat_dir, "tasks", tid + ".md")
+    if not (tid.startswith("a2a-") and os.path.exists(p)):
+        return None
+    with open(p) as fh:
+        m = re.search(r"^From (@[a-z0-9._=/-]+:[A-Za-z0-9.-]+) in ([#!][A-Za-z0-9._=:-]{1,200})"
+                      r"(?: topic ([A-Za-z0-9][A-Za-z0-9._-]{0,100}))?, event (\$[A-Za-z0-9_+/=-]{8,200}),",
+                      fh.read(4000), re.M)
+    return m.groups() if m else None
+
+
+def alert_argv(seat, cfg, tid, detail):
+    """The a2a post that reports a dead seat: a reply in the task's own thread for an a2a task, else the configured
+    alert room; None when neither exists (the bridge log still records it)."""
+    a2a, ident = cfg["a2a"], cfg["identity"]
+    text = ("seat DOWN: ws-%s stopped working on task %s (%s). It is not being worked on. "
+            "Re-send the task with ws task --replace, or restart the seat." % (seat, tid or "-", detail))
+    origin = task_origin(cfg["dir"], tid) if tid else None
+    if origin:
+        sender, room, topic, ev = origin
+        where = ["--topic", topic] if topic else []
+        return [a2a, "--as", ident, "post", room, *where, "--re", ev, "--kind", "notice", "--to", localpart(sender), text]
+    alert = cfg.get("alert")
+    if alert:
+        where = ["--topic", alert["topic"]] if alert.get("topic") else []
+        to = ["--to", ",".join(localpart(m) for m in alert["to"])] if alert.get("to") else []
+        return [a2a, "--as", ident, "post", alert["room"], *where, "--kind", "notice", *to, text]
+    return None
+
+
+def bridge_pass(seat, cfg, log):
+    """One liveness and queue pass: post ONE "seat DOWN" notice per new API error, and start the next queued task
+    in a fresh session once the seat is free."""
+    d = cfg["dir"]
+    st = read_state(d)
+    status, detail = seat_health(seat, cfg)
+    if status == "down" and st.get("alerted") != detail:
+        argv = alert_argv(seat, cfg, st.get("task"), detail)
+        if argv:
+            p = subprocess.run(argv, env=bridge_env(cfg), capture_output=True, text=True)
+            log("seat DOWN (%s): alert rc=%d" % (detail, p.returncode))
+        else:
+            log("seat DOWN (%s): no alert target configured" % detail)
+        st["alerted"] = detail
+        write_state(d, st)
+    elif status == "ok" and st.get("alerted"):
+        st.pop("alerted")
+        write_state(d, st)
+    queue = st.get("queue", [])
+    if queue and busy(seat, cfg) is None:
+        tid = queue[0]
+        st["queue"] = queue[1:]
+        write_state(d, st)
+        launch(seat, cfg, tid)
+        log("queued task %s delivered in a fresh session" % tid)
 
 
 def cmd_identity(seat):
@@ -682,8 +852,11 @@ def main(argv):
         if c == "down":
             return cmd_down(seat)
         if c == "task":
-            need(len(more) == 1, "ws task SEAT FILE")
-            return cmd_task(seat, more[0])
+            files = [a for a in more if a != "--replace"]
+            need(len(files) == 1 and len(more) - len(files) <= 1, "ws task SEAT FILE [--replace]")
+            return cmd_task(seat, files[0], replace="--replace" in more)
+        if c == "health":
+            return cmd_health(seat)
         if c == "nudge":
             need(len(more) == 1, "ws nudge SEAT TASK_ID")
             return cmd_nudge(seat, more[0])
