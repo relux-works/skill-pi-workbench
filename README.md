@@ -15,6 +15,6 @@ identity with a mail bridge, and keeps a per-task cost ledger from pi's own usag
 | `scripts/ws` | seats: init, up, down, task, bridge, identity, autostart, ledger, status | `python3 -I scripts/ws help` | `$XDG_CONFIG_HOME/pi-workbench/seats/`, the seat directory, boot units |
 | `tests/run.sh` | unit tests in a scratch HOME | `sh tests/run.sh` | none (scratch removed) |
 
-The mail bridge is a stopgap until the Swarma session host delivers mail into sessions (book chapter 07).
+The mail bridge is a stopgap until the Swarma session host ([swarma-session-host](https://github.com/relux-works/swarma-session-host)) delivers mail into sessions (the Swarma book, chapter 07).
 
 License: Apache-2.0.

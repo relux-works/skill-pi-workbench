@@ -16,9 +16,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: tmux (the integration test must run, not skip)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update -q && sudo apt-get install -y -q tmux; else brew install tmux; fi
+          tmux -V
       - name: Python
         run: python3 -I -c "import sys; print(sys.version)"
       - name: Unit tests
+        env:
+          WS_REQUIRE_TMUX: "1"
         run: sh tests/run.sh
       - name: CLI smoke (help, refusal exit code)
         run: |

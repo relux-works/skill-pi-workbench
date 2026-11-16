@@ -6,7 +6,7 @@ description: >
   own Swarma/a2a identity, turn mail addressed to that identity into tasks, and keep a per-task cost ledger from pi's
   own usage records. Use for: "set up a persistent pi reviewer", "workbench seat", "hand a task to the pi seat",
   "seat survives reboot", "give the seat an a2a identity", "how much did the pi seats cost", ws task, ws ledger.
-  Triggers (ru): верстак pi, поднять верстак, автозапуск верстака, личность верстака в сварме, учёт работы pic/pix.
+  Triggers (ru): верстак pi, поднять верстак, автозапуск верстака, личность верстака в сварме, учёт работы верстака.
 ---
 
 # pi workbench seats
@@ -26,6 +26,10 @@ SEAT_DIR/
 
 All commands are one script, `scripts/ws` (Python 3, standard library only). Call it by its path (or the shim your
 skill manager installs); boot units call it by absolute path with `python3 -I`.
+
+Requirements: tmux 3.2 or newer (`new-session -e`), pi on the machine with its own auth (`pi /login` or its auth file),
+and for an identity the a2a CLI ([skill-a2a](https://github.com/relux-works/skill-a2a)). Boot units get NO login shell
+environment: a key exported in `.zshrc` or `.bashrc` never reaches the seat, so keep provider keys in pi's own auth.
 
 ## Hard rules
 
@@ -49,6 +53,7 @@ $WS init review-1 --dir ~/workbench/review-1 \
 # 3. the Swarma identity (needs the a2a CLI and its owner-approved server profile; see the a2a skill)
 $WS identity review-1        # a2a identity ensure --role rev --project project-ws --runtime none --dir SEAT_DIR
 #    then by hand, because it is outward-facing: publish the agent card, post the join notice your swarm expects
+#    (both described in skill-a2a)
 # 4. start now and after every reboot
 $WS autostart review-1
 $WS status
@@ -76,6 +81,8 @@ PATH). `--force` replaces an existing config; the seat directory is kept.
 - `local.pi-workbench.ledger.plist`: StartInterval 600.
 - LaunchAgents start at that user's **login**. A Mac that must come back unattended needs automatic login for the user,
   or a LaunchDaemon with `UserName` (root-installed; not done by this skill). FileVault blocks automatic login.
+- `ws autostart` over SSH on a Mac where the user has no GUI session fails at `launchctl bootstrap gui/$UID`; log in at
+  the Mac once, then run it again.
 
 Check after a reboot: `ws status` (session up), `tmux ls`, `systemctl --user status 'pi-workbench-*'` or
 `launchctl print gui/$UID/local.pi-workbench.SEAT`.
@@ -98,17 +105,25 @@ as its identity. `ws bridge SEAT` (a boot unit) loops:
 1. `a2a --as ID wait --to-me-only --timeout 25m`
 2. `a2a --as ID inbox --json --limit 20` (this receipts exactly the printed entries)
 3. each event: type `to`, sender in `allow`, valid event id, room and topic, or it is skipped and logged
-4. a task file `tasks/a2a-<UTC stamp>-<event prefix>.md` with the body and the exact reply command, built with POSIX
-   shell quoting from validated fields only: `a2a --as ID post ROOM --topic T --re EVENT --kind answer --to SENDER
-   @out/<id>-RESULT.md` (plus `a2a fetch` for an attachment and an `a2a attach` fallback for long results)
+4. a task file `tasks/a2a-<UTC stamp>-<event prefix>.md`. Everything the bridge states comes FIRST, from validated
+   fields only and with POSIX shell quoting: the header, the reply command `a2a --as ID post ROOM --topic T --re EVENT
+   --kind answer --to SENDER @out/<id>-RESULT.md`, an `a2a attach` fallback, and `a2a fetch` for an attachment. The
+   body comes LAST, inside a fence longer than any backtick run in it, so a body cannot forge a section or a command
 5. the task is typed into the session; the seat posts its own result.
 
 The bridge drops `A2A_CONFIG_DIR` so it can never borrow another identity's config. A send that is addressed to the
-seat but comes from a sender not in `allow` is logged in `bridge.log` and never reaches the seat.
+seat but comes from a sender not in `allow` is logged in `bridge.log` and never reaches the seat (test
+`Commands.test_bridge_once` proves this with a stub a2a and tmux; `Ingest.test_refusals_with_control` covers each
+refusal reason beside an accepted control). Room event IDs that contain `:` (room versions 1 and 2) are not accepted.
+
+Delivery is **at most once**: `a2a inbox` receipts the entries before the bridge writes the tasks, so a crash in
+between loses that batch (it stays visible in the room). A task whose nudge fails stays in `tasks/`; hand it again
+with tmux or re-run `ws up`.
 
 **Status: a stopgap.** In the Swarma platform, delivering mail into sessions and waking them is the session host's job
-(book chapter 07; repository `swarma-session-host`). When a session host runs on the machine, move the seats to it and
-retire `ws bridge`; keep `ws up`, `ws task` and the ledger.
+(the Swarma book, [swarma-docs](https://github.com/relux-works/swarma-docs), chapter 07; implementation
+[swarma-session-host](https://github.com/relux-works/swarma-session-host)). When a session host runs on the machine,
+move the seats to it and retire `ws bridge`; keep `ws up`, `ws task` and the ledger.
 
 ## Ledger: what the seats cost
 
@@ -124,7 +139,9 @@ $WS ledger sum               # totals and rows per seat
 $WS ledger sum 2026-11-16    # one UTC day
 ```
 
-Compare with the provider console: pi's cost is list price and leaves out discounts and batch pricing.
+Compare with the provider console: pi's cost is list price and leaves out discounts and batch pricing. A row is final:
+work on the same task after its row was written (a pause of 2 minutes or more after an out/ file appeared) is not added
+to it; give a follow-up its own task id.
 
 ## Failure modes
 
